@@ -74,7 +74,8 @@ Pontos principais:
 ### Workflow não aparece nos repositórios
 
 1. Confirme o secret `GEMINI_CODE_REVIEW_API` na **organização**.
-2. Repo `.github` deve ser **public** ou **internal**.
+2. Repo `.github` deve ser **public** ou **private** (Access = `organization`
+   em Settings → Actions). Nesta org o repo é **private** com access organization.
 3. Verifique permissões do GitHub App / token e se Actions estão habilitadas.
 
 ### Review não é gerado
@@ -86,12 +87,25 @@ Pontos principais:
 ### Secret org
 
 ```bash
-# Requer escopo admin:org / secrets da organização
+# Preferencial: script local (pede a chave ou usa env)
+GEMINI_CODE_REVIEW_API='sua-chave' ./scripts/setup-org-secret.sh
+
+# Ou direto via gh (requer escopo admin:org / Actions secrets)
 gh secret set GEMINI_CODE_REVIEW_API --org Interativa-group --visibility all
 ```
 
-Se o token local não tiver permissão, configure em:
-GitHub → Organization → Settings → Secrets and variables → Actions.
+O token OAuth atual (`repo`, `read:org`, `gist`) **não** consegue criar secrets
+de organização. Use o script acima após `gh auth refresh -s admin:org,repo`,
+ou configure no UI:
+
+https://github.com/organizations/Interativa-group/settings/secrets/actions
+
+Nome: `GEMINI_CODE_REVIEW_API` · Access: All repositories.
+
+Opcional: variável de org `GEMINI_MODEL` (default no caller: `gemini-2.0-flash`).
+
+**Status (2026-07-22):** access de Actions do repo `.github` já está
+`organization`. Secret org ainda pendente de chave Gemini + permissão de API.
 
 ## Links úteis
 

@@ -48,10 +48,12 @@ cp "$ROOT_DIR/workflows/ai-review-caller.yaml" scripts/ai-review-caller.yaml
 cp "$ROOT_DIR/scripts/deploy-review-workflow.sh" scripts/deploy-review-workflow.sh
 cp "$ROOT_DIR/scripts/setup-org-secret.sh" scripts/setup-org-secret.sh
 cp "$ROOT_DIR/scripts/publish-org-repo.sh" scripts/publish-org-repo.sh
+cp "$ROOT_DIR/scripts/gemini_review.py" scripts/gemini_review.py
 cp "$ROOT_DIR/scripts/repos.txt" scripts/repos.txt
 cp "$ROOT_DIR/README.md" README.md
 cp "$ROOT_DIR/profile/README.md" profile/README.md
 chmod +x scripts/deploy-review-workflow.sh scripts/setup-org-secret.sh scripts/publish-org-repo.sh
+chmod +x scripts/gemini_review.py
 
 git add -A
 if git diff --cached --quiet; then

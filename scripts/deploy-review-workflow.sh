@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy ai-review-caller.yaml to each repo listed in repos.txt
-# Opens a PR per repo (idempotent if file already matches).
+# Opens or updates a PR per repo (idempotent if file already matches).
 
 set -euo pipefail
 
@@ -46,7 +46,8 @@ for repo in "${REPOS[@]}"; do
 
   if ! gh repo view "$full" --json name -q .name >/dev/null 2>&1; then
     echo "  SKIP: repo not found or no access"
-    ((skipped++)) || true
+    skipped=$((skipped + 1))
+    echo
     continue
   fi
 
@@ -56,41 +57,63 @@ for repo in "${REPOS[@]}"; do
   default_branch="$(gh repo view "$full" --json defaultBranchRef -q .defaultBranchRef.name)"
   if [[ -z "$default_branch" ]]; then
     echo "  FAIL: could not resolve default branch"
-    ((failed++)) || true
+    failed=$((failed + 1))
+    echo
     continue
   fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "  DRY_RUN: would add $WORKFLOW_PATH on branch $BRANCH from $default_branch"
-    ((success++)) || true
+    success=$((success + 1))
+    echo
     continue
   fi
 
   if ! gh repo clone "$full" "$clone_dir" -- --depth 1 -b "$default_branch" >/dev/null 2>&1; then
     echo "  FAIL: clone failed"
-    ((failed++)) || true
+    failed=$((failed + 1))
+    echo
     continue
   fi
 
+  status_file="$WORKDIR/${repo}.status"
+  rm -f "$status_file"
+
   (
+    set -euo pipefail
     cd "$clone_dir"
     mkdir -p "$(dirname "$WORKFLOW_PATH")"
 
-    if [[ -f "$WORKFLOW_PATH" ]] && cmp -s "$CALLER_SRC" "$WORKFLOW_PATH"; then
-      echo "  SKIP: caller already up to date"
-      exit 10
+    git fetch origin "$default_branch" --depth 1 >/dev/null 2>&1 || true
+
+    if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+      git fetch origin "$BRANCH" --depth 50 >/dev/null 2>&1 || true
+      if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+      else
+        # Shallow clone may not create origin/$BRANCH ref; fetch into local branch
+        git fetch origin "refs/heads/$BRANCH:refs/heads/$BRANCH" --depth 50
+        git checkout "$BRANCH"
+      fi
+    else
+      git checkout -B "$BRANCH" "origin/$default_branch"
     fi
 
-    # Reset local branch if it already exists from a previous run
-    git fetch origin "$default_branch" --depth 1 >/dev/null 2>&1 || true
-    git checkout -B "$BRANCH" "origin/$default_branch" >/dev/null 2>&1
-
     cp "$CALLER_SRC" "$WORKFLOW_PATH"
-    git add "$WORKFLOW_PATH"
 
+    if [[ -f "$WORKFLOW_PATH" ]] && git show "HEAD:$WORKFLOW_PATH" >/dev/null 2>&1; then
+      if cmp -s "$CALLER_SRC" <(git show "HEAD:$WORKFLOW_PATH"); then
+        echo "  SKIP: caller already up to date on $BRANCH"
+        echo skip > "$status_file"
+        exit 0
+      fi
+    fi
+
+    git add "$WORKFLOW_PATH"
     if git diff --cached --quiet; then
       echo "  SKIP: nothing to commit"
-      exit 10
+      echo skip > "$status_file"
+      exit 0
     fi
 
     git -c user.email="ai-code-review@interativa.local" \
@@ -102,14 +125,20 @@ Wire the org reusable Gemini review so every PR gets an automated comment.
 EOF
 )"
 
-    if ! git push -u origin "$BRANCH" --force-with-lease >/dev/null 2>&1; then
-      echo "  FAIL: push failed"
-      exit 11
+    if ! git push -u origin "HEAD:$BRANCH" --force-with-lease 2>/tmp/ai-review-push.err; then
+      echo "  WARN: force-with-lease failed; retrying with force"
+      if ! git push -u origin "HEAD:$BRANCH" --force 2>/tmp/ai-review-push.err; then
+        echo "  FAIL: push failed"
+        cat /tmp/ai-review-push.err >&2 || true
+        echo fail > "$status_file"
+        exit 1
+      fi
     fi
 
     existing_pr="$(gh pr list --repo "$full" --head "$BRANCH" --state open --json number -q '.[0].number' 2>/dev/null || true)"
     if [[ -n "$existing_pr" ]]; then
       echo "  OK: updated existing PR #$existing_pr"
+      echo ok > "$status_file"
       exit 0
     fi
 
@@ -133,15 +162,19 @@ EOF
 )")"
 
     echo "  OK: created $pr_url"
+    echo ok > "$status_file"
   )
-  rc=$?
-  if [[ $rc -eq 0 ]]; then
-    ((success++)) || true
-  elif [[ $rc -eq 10 ]]; then
-    ((skipped++)) || true
-  else
-    ((failed++)) || true
+
+  result="fail"
+  if [[ -f "$status_file" ]]; then
+    result="$(cat "$status_file")"
   fi
+
+  case "$result" in
+    ok) success=$((success + 1)) ;;
+    skip) skipped=$((skipped + 1)) ;;
+    *) failed=$((failed + 1)) ;;
+  esac
   echo
 done
 

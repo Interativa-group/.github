@@ -10,7 +10,14 @@ import urllib.request
 
 
 def main() -> None:
-    api_key = os.environ["GEMINI_API_KEY"]
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit(
+            "GEMINI_API_KEY vazio. Configure o secret de organização "
+            "GEMINI_CODE_REVIEW_API em "
+            "https://github.com/organizations/Interativa-group/settings/secrets/actions"
+        )
+
     model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
     language = os.environ.get("REVIEW_LANGUAGE", "pt-BR")
     title = os.environ.get("PR_TITLE") or ""

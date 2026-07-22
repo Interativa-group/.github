@@ -1,0 +1,241 @@
+name: AI Code Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gemini_model:
+        description: "Gemini model name"
+        type: string
+        required: false
+        default: "gemini-2.0-flash"
+      language:
+        description: "Review language"
+        type: string
+        required: false
+        default: "pt-BR"
+      max_diff_chars:
+        description: "Max characters of diff sent to Gemini"
+        type: number
+        required: false
+        default: 120000
+    secrets:
+      GEMINI_CODE_REVIEW_API:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event.pull_request != null
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Collect PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+        run: |
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          DIFF_FILE="$RUNNER_TEMP/pr.diff"
+
+          git fetch origin "$BASE_SHA" --depth=1 || true
+          git diff --unified=3 "$BASE_SHA...$HEAD_SHA" -- \
+            ':(exclude)*.lock' \
+            ':(exclude)*-lock.json' \
+            ':(exclude)*.min.js' \
+            ':(exclude)*.min.css' \
+            ':(exclude)*.map' \
+            ':(exclude)*.png' \
+            ':(exclude)*.jpg' \
+            ':(exclude)*.jpeg' \
+            ':(exclude)*.gif' \
+            ':(exclude)*.webp' \
+            ':(exclude)*.svg' \
+            ':(exclude)*.ico' \
+            ':(exclude)*.pdf' \
+            ':(exclude)*.woff*' \
+            ':(exclude)*.ttf' \
+            > "$DIFF_FILE" || true
+
+          if [ ! -s "$DIFF_FILE" ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "No textual diff to review."
+            exit 0
+          fi
+
+          CHAR_COUNT="$(wc -c < "$DIFF_FILE" | tr -d ' ')"
+          if [ "$CHAR_COUNT" -gt "$MAX_DIFF_CHARS" ]; then
+            head -c "$MAX_DIFF_CHARS" "$DIFF_FILE" > "$DIFF_FILE.tmp"
+            printf '\n...\n[diff truncado por tamanho]\n' >> "$DIFF_FILE.tmp"
+            mv "$DIFF_FILE.tmp" "$DIFF_FILE"
+          fi
+
+          {
+            echo "empty=false"
+            echo "diff_file=$DIFF_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ask Gemini for review
+        id: gemini
+        if: steps.diff.outputs.empty != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_CODE_REVIEW_API }}
+          GEMINI_MODEL: ${{ inputs.gemini_model }}
+          REVIEW_LANGUAGE: ${{ inputs.language }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_DIFF_FILE: ${{ steps.diff.outputs.diff_file }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          api_key = os.environ["GEMINI_API_KEY"]
+          model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+          language = os.environ.get("REVIEW_LANGUAGE", "pt-BR")
+          title = os.environ.get("PR_TITLE") or ""
+          body = os.environ.get("PR_BODY") or ""
+          diff_file = os.environ.get("PR_DIFF_FILE") or ""
+          with open(diff_file, encoding="utf-8", errors="replace") as df:
+              diff = df.read()
+          repo = os.environ.get("REPO") or ""
+          pr_number = os.environ.get("PR_NUMBER") or ""
+
+          prompt = f"""Você é um revisor de código sênior da organização Interativa-group.
+Revise o pull request abaixo e responda em {language}.
+
+Repositório: {repo}
+PR #{pr_number}
+Título: {title}
+
+Descrição:
+{body}
+
+Diff:
+```diff
+{diff}
+```
+
+Instruções:
+1. Foque em bugs reais, regressões e problemas de lógica.
+2. Avalie qualidade (legibilidade, tipagem, testes, manutenibilidade).
+3. Verifique segurança (SQL injection, XSS, vazamento de secrets, authz/authn).
+4. Ignore estilo cosmético e arquivos gerados.
+5. Seja conciso e objetivo. Formate a resposta em markdown.
+6. Estruture assim:
+   - Resumo
+   - Problemas encontrados (se houver), com severidade
+   - Sugestões de melhoria
+   - Conclusão (aprovar com ressalvas / precisa ajustes / ok)
+"""
+
+          url = (
+              f"https://generativelanguage.googleapis.com/v1beta/models/"
+              f"{model}:generateContent?key={api_key}"
+          )
+          payload = {
+              "contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {
+                  "temperature": 0.2,
+                  "maxOutputTokens": 4096,
+              },
+          }
+
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  data = json.load(resp)
+          except urllib.error.HTTPError as e:
+              err_body = e.read().decode("utf-8", errors="replace")
+              raise SystemExit(f"Gemini API error {e.code}: {err_body}") from e
+
+          candidates = data.get("candidates") or []
+          if not candidates:
+              raise SystemExit(f"Gemini returned no candidates: {json.dumps(data)[:2000]}")
+
+          parts = (((candidates[0] or {}).get("content") or {}).get("parts")) or []
+          text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+          if not text:
+              raise SystemExit("Gemini returned empty review text")
+
+          header = "## Interativa AI Code Review\n\n"
+          footer = (
+              "\n\n---\n"
+              f"_Modelo: `{model}` · gerado automaticamente em cada atualização da PR._"
+          )
+          review = header + text + footer
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a", encoding="utf-8") as fh:
+              fh.write("review<<EOF_REVIEW\n")
+              fh.write(review)
+              fh.write("\nEOF_REVIEW\n")
+          PY
+
+      - name: Post review comment
+        if: steps.diff.outputs.empty != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = process.env.REVIEW_BODY;
+            if (!body) {
+              core.setFailed('Review body is empty');
+              return;
+            }
+
+            const marker = '## Interativa AI Code Review';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+
+            const existing = comments.find((c) =>
+              c.user?.type === 'Bot' && c.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing AI review comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              core.info('Created new AI review comment');
+            }
+        env:
+          REVIEW_BODY: ${{ steps.gemini.outputs.review }}
+
+      - name: Skip notice
+        if: steps.diff.outputs.empty == 'true'
+        run: echo "Nenhum diff textual para revisar."
